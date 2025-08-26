@@ -1,0 +1,11 @@
+type: GaussianWarp
+K: 20
+node_shape: [10, 10, 10]
+max_densify_num: 5000
+sparsification: 8
+max_contribution: 0.002
+min_contribution: 1e-7
+with_quaternion: true
+anisotropy: 
+  scaling: false
+  quaternion: false

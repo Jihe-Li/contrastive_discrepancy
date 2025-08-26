@@ -1,0 +1,21 @@
+defaults:
+  - _self_
+  - network: gaussian
+
+chunk_size: 50000
+max_steps: 2000
+warmup_steps: 50
+seed: 6
+
+case_idx: 1
+enable_densify: false
+densify_from_iter: 300
+densify_until_ratio: 0.6
+densify_interval_ratio: 0.05
+lr: 
+  node_position: 0.005
+  node_radius: 0.02
+  node_quaternion: 0.005
+  node_scaling: 0.01
+  translation: 0.002
+  quaternion: 0.005
