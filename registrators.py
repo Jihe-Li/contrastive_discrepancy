@@ -1,248 +1,204 @@
 import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from datasets import CDDataset
+import datasets
 import losses
-import networks
-import utils
 import metrics
+import networks
+import transforms
+import utils
 
 
 class CDRegistrator:
+    """Computes Contrastive Discrepancy for one fixed/moving pair.
+
+    Up to three registrations are run with the same model and hyperparameters:
+
+    ``a``         ``F -> M_a``, the observed moving image;
+    ``b``         ``F -> M_b`` with ``M_b = g * M_a``, a second observation drawn
+                  from the same anatomical orbit;
+    ``residual``  ``M_a o phi_a -> M_b o phi_b``, needed only for CD3.
+
+    Both warped results live in the coordinate frame of the fixed image, which is
+    what makes the two deformation fields comparable. CD2 is the masked MAE
+    between them; CD3 is the mean norm of the residual field.
+    """
+
     def __init__(self, cfg):
-        self.chunk_size = cfg.chunk_size
-        self.max_steps = cfg.max_steps
-        self.warmup_steps = cfg.warmup_steps
+        self.cfg = cfg
         torch.manual_seed(cfg.seed)
+        self.device = self._resolve_device(cfg.device)
+        self.wanted = {"CD2", "CD3"} if cfg.metric == "both" else {cfg.metric}
+        self.seeds = self._derive_seeds(cfg)
 
-        self.enable_densify = cfg.enable_densify
-        if self.enable_densify:
-            self.densify_from_iter = cfg.densify_from_iter
-            self.densify_until_ratio = cfg.densify_until_ratio
-            self.densify_interval_ratio = cfg.densify_interval_ratio
+        self.dataset = utils.create(datasets, cfg.datasets, seed=self.seeds["dataset"])
+        self.transform = utils.create(transforms, cfg.transform, self.dataset.shape)
+        self.dataset.build_orbit_sample(self.transform).to(self.device)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dataset = CDDataset(cfg.case_idx)
-        self.dataset.to(self.device)
-        self.shape = self.dataset.shape
+        self.criterion = getattr(losses, cfg.similarity)().to(self.device)
+        self.branches = {}
+        self.base_lr = None
 
-        self.criterion = losses.NCC().to(self.device)
-        self.lambda_tv = 8
+    # ----------------------------------------------------------------- set-up
 
-        self.network: nn.Module = utils.create(networks, cfg.network)
-        self.network.reinitialize(self.dataset.fix_mask) 
-        self.network.to(self.device)
+    @staticmethod
+    def _derive_seeds(cfg):
+        """One independent seed per component, all determined by ``cfg.seed``.
 
-        self.network2: networks.GaussianWarp = utils.create(networks, cfg.network)
-        self.network2.reinitialize(self.dataset.fix_mask)
-        self.network2.to(self.device)
+        Every source of randomness draws from its own generator, so the result
+        depends on the seed alone and not on the order in which the dataset and
+        the three branches happen to be constructed.
+        """
+        master = torch.Generator().manual_seed(cfg.seed)
+        dataset, a, b, residual = torch.randint(0, 2 ** 31 - 1, (4,),
+                                                generator=master).tolist()
+        return dict(dataset=dataset, a=a, b=a if cfg.paired_init else b,
+                    residual=residual)
 
-        self.network3: networks.GaussianWarp = utils.create(networks, cfg.network)
-        self.network3.reinitialize(self.dataset.fix_mask)
-        self.network3.to(self.device)
+    @staticmethod
+    def _resolve_device(name):
+        if name != "cpu" and not torch.cuda.is_available():
+            print("[CDRegistrator] CUDA is unavailable, falling back to CPU.")
+            return torch.device("cpu")
+        return torch.device(name)
 
-        self.optimizer =  optim.Adam(self.network.trained_parameters(cfg.lr))
-        self.optimizer2 = optim.Adam(self.network2.trained_parameters(cfg.lr))
-        self.optimizer3 = optim.Adam(self.network3.trained_parameters(cfg.lr))
+    def branch(self, name):
+        """Return the (network, optimizer) pair of a branch, building it on first use."""
+        if name in self.branches:
+            return self.branches[name]
 
-        self.lr = {}
-        for group in self.optimizer.param_groups:
-            self.lr[group["name"]] = group["lr"]
+        generator = torch.Generator().manual_seed(self.seeds[name])
+        network = utils.create(networks, self.cfg.network)
+        network.reinitialize(self.dataset.fix_mask, generator)
+        network.to(self.device)
+        optimizer_cls = getattr(optim, self.cfg.optimizer.type)
+        optimizer = optimizer_cls(network.trained_parameters(self.cfg.optimizer.lr))
 
-    @torch.no_grad()
-    def adaptive_control(self, step, network, optimizer):
-        if self.enable_densify and step <= self.densify_until_ratio * self.max_steps \
-                and self.densify_from_iter < self.max_steps * self.densify_until_ratio:  
-            network.add_densification_stats()   
+        if self.base_lr is None:
+            self.base_lr = {g["name"]: g["lr"] for g in optimizer.param_groups}
+        self.branches[name] = (network, optimizer)
+        return self.branches[name]
 
-            if step >= self.densify_from_iter and step % (self.densify_interval_ratio * self.max_steps) == 0:
-                network.densify_and_prune(optimizer=optimizer)  
+    def _set_lr(self, optimizer, step):
+        """Linear warm-up followed by cosine decay, per parameter group."""
+        warmup = max(self.cfg.optimizer.schedule.warmup_steps, 1)
+        total = self.cfg.max_steps
+        for group in optimizer.param_groups:
+            base = self.base_lr[group["name"]]
+            if step <= warmup:
+                group["lr"] = step / warmup * base
+            else:
+                ratio = (step - warmup) / (total + 1 - warmup)
+                group["lr"] = (math.cos(math.pi * ratio) + 1) / 2 * base
 
-    def tv_regulizer(self, acc_flow):
-        center_flow = acc_flow[:acc_flow.shape[0] // (self.dataset.neighs + 1)]
-        neighs_flow = acc_flow[acc_flow.shape[0] // (self.dataset.neighs + 1):].reshape(-1, self.dataset.neighs, 3)
-        diff_norm = torch.norm(neighs_flow - center_flow[:, None], dim=-1)
-        return diff_norm.mean()
+    def tv_regularizer(self, flow):
+        """Mean displacement difference between each centre and its neighbours."""
+        num_centers = flow.shape[0] // (self.dataset.neighs + 1)
+        center = flow[:num_centers]
+        neighs = flow[num_centers:].reshape(-1, self.dataset.neighs, 3)
+        return torch.norm(neighs - center[:, None], dim=-1).mean()
 
-    def get_cur_lr(self, step, lr):
-        if step <= self.warmup_steps:
-            cur_lr = step / self.warmup_steps * lr
-        else:
-            ratio = (step - self.warmup_steps) / (self.max_steps + 1 - self.warmup_steps)
-            cur_lr = (math.cos(math.pi * ratio) + 1) / 2 * lr
-        return cur_lr
+    # ----------------------------------------------------------- registration
 
-    def train_step(self, step):
-        """Perform one iteration of training."""
-        self.optimizer.zero_grad()
-        coords = next(self.dataset_iter)
-        with torch.no_grad():
-            fix_val = self.dataset.samp_fix(coords)
-        
-        acc_flow = self.network(coords)
-        tar_coords = acc_flow + coords
-        warp_val = self.dataset.samp_mov(tar_coords)
+    def optimize(self, branch, samp_fix, samp_mov, desc):
+        """Run one full registration of ``samp_mov`` onto ``samp_fix``."""
+        network, optimizer = self.branch(branch)
+        network.train()
+        self.dataset.reseed(self.seeds[branch])
+        iterator = iter(self.dataset)
 
-        loss = self.criterion(warp_val, fix_val)
-        loss += self.lambda_tv * self.tv_regulizer(acc_flow)
-        loss.backward()
+        for step in tqdm(range(1, self.cfg.max_steps + 1), ncols=80, desc=desc):
+            self._set_lr(optimizer, step)
+            coords = next(iterator)
+            with torch.no_grad():
+                fix_val = samp_fix(coords)
 
-        self.adaptive_control(step, self.network, self.optimizer)
-        self.optimizer.step()
+            optimizer.zero_grad()
+            flow = network(coords)
+            warp_val = samp_mov(coords + flow)
 
-    def train_step_aug(self, step):
-        """Perform one iteration of training."""
-        coords = next(self.dataset_iter)
-        with torch.no_grad():
-            fix_val = self.dataset.samp_fix(coords)
+            loss = self.criterion(warp_val, fix_val)
+            if self.cfg.lambda_tv > 0 and self.dataset.neighs > 0:
+                loss = loss + self.cfg.lambda_tv * self.tv_regularizer(flow)
+            loss.backward()
 
-        self.network2.train()
-        self.optimizer2.zero_grad()
-        acc_flow = self.network2(coords)
-        tar_coords = coords + acc_flow
-        warp_val = self.dataset.samp_aug_mov(tar_coords)
+            network.adaptive_control(step, self.cfg.max_steps, optimizer)
+            optimizer.step()
+        return network
 
-        loss = self.criterion(warp_val, fix_val)
-        # tv regularization
-        if self.lambda_tv > 0 and self.dataset.neighs != 0:
-            loss += self.lambda_tv * self.tv_regulizer(acc_flow)
-        loss.backward()
-
-        self.adaptive_control(step, self.network2, self.optimizer2)
-        self.optimizer2.step()
-
-    def train_step_triplet(self, step, warp_arr_fix, warp_arr_mov):
-        """Perform one iteration of training."""
-        coords = next(self.dataset_iter)
-        with torch.no_grad():
-            fix_val = self.dataset._sampling(coords, warp_arr_fix)
-
-        self.network3.train()
-        self.optimizer3.zero_grad()
-        acc_flow = self.network3(coords)
-        tar_coords = coords + acc_flow
-        warp_val = self.dataset._sampling(tar_coords, warp_arr_mov)
-
-        loss = self.criterion(warp_val, fix_val)
-        # tv regularization
-        if self.lambda_tv > 0 and self.dataset.neighs != 0:
-            loss += self.lambda_tv * self.tv_regulizer(acc_flow)
-        loss.backward()
-
-        self.adaptive_control(step, self.network3, self.optimizer3)
-        self.optimizer3.step()
+    def _chunks(self):
+        for i in range(0, len(self.dataset), self.cfg.chunk_size):
+            yield self.dataset[i: i + self.cfg.chunk_size]
 
     @torch.no_grad()
-    def inf_volume_torch(self):
-        """Return the image-values for the given input-coordinates."""
-        self.network.eval()
-
-        warp_vals = []
-        for i in range(0, len(self.dataset), self.chunk_size):
-            coords_i = self.dataset[i : i + self.chunk_size]
-            tar_coords_i = self.network(coords_i) + coords_i
-            warp_val_i = self.dataset.samp_mov(tar_coords_i)
-            warp_vals.append(warp_val_i)
-
-        warp_val = torch.cat(warp_vals, dim=0)
-        warp_val = self.dataset.masked_gather(warp_val, is_flow=False)
-        warp_val = warp_val.reshape(*self.shape)
-        return warp_val
+    def warp_volume(self, branch, samp_mov):
+        """Warp the moving image onto the fixed-image grid."""
+        network, _ = self.branch(branch)
+        network.eval()
+        values = [samp_mov(coords + network(coords)) for coords in self._chunks()]
+        return self.dataset.scatter_to_volume(torch.cat(values, dim=0))
 
     @torch.no_grad()
-    def inf_volume_aug_torch(self):
-        """Return the image-values for the given input-coordinates."""
-        self.network2.eval()
+    def residual_norm(self, branch):
+        """Mean norm of the residual deformation field over the ROI."""
+        network, _ = self.branch(branch)
+        network.eval()
+        scale = self.dataset.image_size / 2
+        if self.cfg.cd3_units == "mm":
+            scale = scale * self.dataset.voxel_size
 
-        warp_vals = []
-        for i in range(0, len(self.dataset), self.chunk_size):
-            coords_i = self.dataset[i : i + self.chunk_size]
-            tar_coords_i = coords_i + self.network2(coords_i)
-            warp_val_i = self.dataset.samp_aug_mov(tar_coords_i)
-            warp_vals.append(warp_val_i)
-
-        warp_val = torch.cat(warp_vals, dim=0)
-        warp_val = self.dataset.masked_gather(warp_val, is_flow=False)
-        warp_val = warp_val.reshape(*self.shape)
-        return warp_val
+        total, count = 0.0, 0
+        for coords in self._chunks():
+            flow = network(coords) * scale
+            total += metrics.field_norm(flow).item() * flow.shape[0]
+            count += flow.shape[0]
+        return total / count
 
     @torch.no_grad()
-    def eval(self):
-        self.network.eval()
-        coords = self.dataset.abs2rel(self.dataset.fix_marks).to(self.device)
+    def landmark_error(self, branch):
+        """Reference TRE in mm; returns ``None`` when the dataset has no landmarks."""
+        if not self.dataset.has_landmarks:
+            return None
+        network, _ = self.branch(branch)
+        network.eval()
 
-        tar_coords = self.network(coords) + coords
-        warp_marks = self.dataset.rel2abs(tar_coords)
-        warp_marks = torch.round(warp_marks)
-
-        mean, std = metrics.compute_landmark_accuracy(
+        coords = self.dataset.abs2rel(self.dataset.fix_marks)
+        warp_marks = self.dataset.rel2abs(coords + network(coords))
+        warp_marks = torch.round(warp_marks)  # DIRLab convention: voxel-level TRE
+        return metrics.compute_landmark_accuracy(
             self.dataset.abs2phys(warp_marks),
             self.dataset.abs2phys(self.dataset.mov_marks),
         )
-        message = "Case{} landmarks (mm): {:.4f}±{:.4f}".format(
-            self.dataset.case_idx, mean[0], std[0]
-        )
-        print(message)
-        return mean, std
 
-    @torch.no_grad()
-    def val_triplet_roi(self):
-        self.network3.eval()
-        image_size = self.dataset.image_size.to(self.device)
+    # ------------------------------------------------------------------- main
 
-        track = []
-        for i in range(0, len(self.dataset), self.chunk_size):
-            coords_i = self.dataset[i : i + self.chunk_size]
-            track_i = self.network3(coords_i)
-            track_i = track_i * image_size / 2
-            track.append(track_i)
+    def run(self):
+        """Register both orbit observations and return the requested CD values."""
+        self.optimize("a", self.dataset.samp_fix, self.dataset.samp_mov, "F->Ma")
+        tre = self.landmark_error("a")
+        warp_a = self.warp_volume("a", self.dataset.samp_mov)
 
-        track = torch.cat(track, dim=0)
-        triplet = metrics.comp_triplet(track)
-        return triplet
+        self.optimize("b", self.dataset.samp_fix, self.dataset.samp_aug_mov, "F->Mb")
+        warp_b = self.warp_volume("b", self.dataset.samp_aug_mov)
 
-    def optimize_stage1(self):
-        self.dataset_iter = iter(self.dataset)
-        for step in tqdm(range(1, self.max_steps + 1), ncols=80):
-            for group in self.optimizer.param_groups:
-                group["lr"] = self.get_cur_lr(step, self.lr[group['name']]) 
-            self.train_step(step)
-        error_mean, error_std = self.eval()
+        result = {}
+        if "CD2" in self.wanted:
+            mask = self.dataset.fix_mask
+            result["CD2"] = (warp_a[mask] - warp_b[mask]).abs().mean().item()
 
-        return self.inf_volume_torch(), error_mean, error_std
+        if "CD3" in self.wanted:
+            self.optimize("residual", self.dataset.sampler(warp_a),
+                          self.dataset.sampler(warp_b), "Ma->Mb")
+            result["CD3"] = self.residual_norm("residual")
 
-    def optimize_stage2(self):
-        """Train the network."""
-        self.dataset.shuffle()
-        self.dataset_iter = iter(self.dataset)
-        for step in tqdm(range(1, self.max_steps + 1), ncols=80):
-            for group in self.optimizer2.param_groups:
-                group["lr"] = self.get_cur_lr(step, self.lr[group['name']]) 
-            self.train_step_aug(step)
+        if tre is not None:
+            result["TRE"] = tre["mean"]
+            result["TRE_std"] = tre["std"]
+        return result
 
-        return self.inf_volume_aug_torch()
-    
-    def optimize_stage3(self, warp_arr_fix, warp_arr_mov):
-        """Train the network."""
-        self.dataset.shuffle()
-        self.dataset_iter = iter(self.dataset)
-        for step in tqdm(range(1, self.max_steps + 1), ncols=80):
-            for group in self.optimizer3.param_groups:
-                group["lr"] = self.get_cur_lr(step, self.lr[group['name']]) 
-            self.train_step_triplet(step, warp_arr_fix, warp_arr_mov)
-
-        return self.val_triplet_roi()
-
-    def evaluate_cd(self):
-        warp_arr_1, error_mean, error_std = self.optimize_stage1()
-        warp_arr_2 = self.optimize_stage2()
-        mask = self.dataset.fix_mask.reshape(-1)
-        CD2 = F.l1_loss(self.dataset.fix_arr.reshape(-1)[mask], self.dataset.mov_arr.reshape(-1)[mask])
-        CD3 = self.optimize_stage3(warp_arr_1.unsqueeze(0).unsqueeze(0), 
-                                       warp_arr_2.unsqueeze(0).unsqueeze(0))
-
-        return CD2, CD3, error_mean, error_std
+    def summary(self, result):
+        fields = ", ".join(f"{k}: {v:.4f}" for k, v in result.items() if k != "TRE_std")
+        return f"{self.dataset.name} | {fields}"

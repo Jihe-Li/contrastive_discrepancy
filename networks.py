@@ -1,248 +1,292 @@
-import numpy as np
-import torch
 from types import SimpleNamespace
+
+import torch
+import torch.nn.functional as F
 import pytorch3d.ops as ops
 from torch import nn
 from tqdm import tqdm
 
 
-class GaussianWarp(nn.Module):
-    def __init__(self, K, node_shape, max_densify_num, sparsification, max_contribution, min_contribution, 
-                 with_quaternion=False, anisotropy=False, **kwargs) -> None:
+class WarpField(nn.Module):
+    """Interface shared by every deformation model in this framework.
+
+    A model maps normalised coordinates ``[N, 3]`` in ``[-1, 1]`` to a
+    displacement field ``[N, 3]`` expressed in the same normalised units.
+    Implementing :meth:`forward` and :meth:`trained_parameters` is enough; the
+    remaining hooks are optional and let a model change its own capacity while
+    the registration runs.
+    """
+
+    def reinitialize(self, mask: torch.Tensor, generator: torch.Generator = None):
+        """Re-instantiate the parameters given the ROI mask of the fixed image.
+
+        ``generator`` carries this model's own randomness; using it instead of the
+        global RNG keeps the initialisation independent of how many other objects
+        were constructed first.
+        """
+
+    def trained_parameters(self, lr):
+        """Return optimiser groups, each carrying a ``name`` and an ``lr``.
+
+        The names are the keys looked up in ``configs/optimizer/*.yaml``.
+        """
+        return [{"params": list(self.parameters()), "name": "default", "lr": lr.default}]
+
+    def adaptive_control(self, step, max_steps, optimizer):
+        """Called after ``backward`` and before ``step`` to grow or prune capacity."""
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class GaussianWarp(WarpField):
+    """GaussianDIR: a displacement field blended from Gaussian primitives.
+
+    Each primitive carries a translation (optionally a rotation) and a radius, and
+    a query point takes the normalised Gaussian-weighted average of its ``K``
+    nearest primitives. Model complexity is governed by ``num_gaussians``, the
+    hyperparameter that Contrastive Discrepancy selects at testing time.
+    """
+
+    def __init__(self, num_gaussians=5000, K=20, sparsification=8,
+                 with_quaternion=True, anisotropy=None, densify=None, **kwargs):
         super().__init__()
+        self.num_gaussians = num_gaussians
         self.K = K
-        self.node_shape = node_shape  
-        self.node_initial_num = np.prod(node_shape)   
-        self.max_densify_num = max_densify_num
-        self.sparsification = sparsification 
-        self.max_contribution = max_contribution
-        self.min_contribution = min_contribution
+        self.sparsification = sparsification
         self.with_quaternion = with_quaternion
-        self.anisotropy = SimpleNamespace(**anisotropy)
-    
-        node_coords, node_radius = self.make_coors(self.node_shape)
-        self.node_position = nn.Parameter(node_coords)          
-        self.translation = nn.Parameter(torch.zeros(self.node_initial_num, 3))   
+        self.anisotropy = SimpleNamespace(**(anisotropy or {}))
+        self.densify = SimpleNamespace(**(densify or {"enabled": False}))
+        self.max_nodes = num_gaussians
 
-        if self.anisotropy.quaternion:  
-            self.node_quaternion = nn.Parameter(torch.concat([torch.ones(self.node_initial_num, 1), 
-                                                torch.zeros(self.node_initial_num, 3)], dim=1))
-        if self.anisotropy.scaling:
-            self._node_scaling = nn.Parameter(torch.ones(self.node_initial_num, 3) * torch.log(node_radius))
-        else:
-            self._node_radius = nn.Parameter(torch.ones(self.node_initial_num, 1) * torch.log(node_radius)) 
+        self._build(*self._lattice_nodes())
 
-        if with_quaternion:
-            self.quaternion = nn.Parameter(torch.concat([torch.ones(self.node_initial_num, 1), 
-                                                         torch.zeros(self.node_initial_num, 3)], dim=1))
+    # -------------------------------------------------------------- lifecycle
 
-        # 记录梯度
-        self.contribution = torch.zeros(self.node_initial_num, device="cuda")
-        self.counter = torch.zeros(self.node_initial_num, device="cuda")
+    @property
+    def _radius(self):
+        """Initial kernel radius, the half-diagonal of a primitive's share of the volume."""
+        return torch.tensor(3.0).sqrt() / self.num_gaussians ** (1 / 3)
 
-    def reinitialize(self, mask: torch.Tensor):
-        node_position = torch.rand((1, 1, 1, self.max_densify_num, 3)) * 2. - 1.
-        node_radius = 1.732 / (torch.tensor(self.max_densify_num) ** (1/3))
-        mask = mask.cpu().unsqueeze(0).unsqueeze(0).float()
-        node_mask = torch.nn.functional.grid_sample(mask, node_position, mode='nearest', align_corners=False) \
-                    .squeeze().bool()
+    def _lattice_nodes(self):
+        """A deterministic placeholder, so that constructing the model draws no RNG.
 
-        self.node_initial_num = node_mask.sum()
-        self.node_position = nn.Parameter(node_position.squeeze()[node_mask])
+        ``reinitialize`` replaces these with ROI-restricted random samples. Keeping
+        ``__init__`` free of random draws makes a model's initialisation depend only
+        on the seed, not on how many other objects were constructed before it.
+        """
+        side = max(round(self.num_gaussians ** (1 / 3)), 1)
+        axis = torch.linspace(-1, 1, side + 1)[:-1] + 1 / side
+        grid = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1)
+        return grid.reshape(-1, 3), self._radius
+
+    def _sample_nodes(self, mask, generator=None):
+        """Draw primitives uniformly in ``[-1, 1]^3``, keeping those inside the ROI."""
+        positions = torch.rand(1, 1, 1, self.num_gaussians, 3, generator=generator) * 2.0 - 1.0
+        inside = F.grid_sample(mask[None, None].cpu().float(), positions,
+                               mode="nearest", align_corners=False).squeeze().bool()
+        return positions.reshape(-1, 3)[inside], self._radius
+
+    def _build(self, positions, radius):
+        num = positions.shape[0]
+        log_radius = torch.log(radius)
+        identity_quat = torch.cat([torch.ones(num, 1), torch.zeros(num, 3)], dim=1)
+
+        self.node_position = nn.Parameter(positions)
+        self.translation = nn.Parameter(torch.zeros(num, 3))
         if self.anisotropy.quaternion:
-            self.node_quaternion = nn.Parameter(torch.concat([torch.ones(self.node_initial_num, 1), 
-                                                torch.zeros(self.node_initial_num, 3)], dim=1))
+            self.node_quaternion = nn.Parameter(identity_quat.clone())
         if self.anisotropy.scaling:
-            self._node_scaling = nn.Parameter(torch.ones(self.node_initial_num, 3) * torch.log(node_radius))
+            self._node_scaling = nn.Parameter(torch.full((num, 3), log_radius.item()))
         else:
-            self._node_radius = nn.Parameter(torch.ones(self.node_initial_num, 1) * torch.log(node_radius))
-        self.translation = nn.Parameter(torch.zeros(self.node_initial_num, 3))
+            self._node_radius = nn.Parameter(torch.full((num, 1), log_radius.item()))
         if self.with_quaternion:
-            self.quaternion = nn.Parameter(torch.concat([torch.ones(self.node_initial_num, 1), 
-                                                         torch.zeros(self.node_initial_num, 3)], dim=1))
-        
-        self.max_densify_num = mask.sum().int().item() // (self.sparsification ** 3)
-        self.contribution = torch.zeros(self.node_position.shape[0], device="cuda")
-        self.counter = torch.zeros(self.node_position.shape[0], device="cuda")
-        print('The initial number of Gaussians is %d.' % self.node_position.shape[0])
+            self.quaternion = nn.Parameter(identity_quat.clone())
+        self.reset_stats()
+
+    def reinitialize(self, mask, generator=None):
+        self.generator = generator
+        self._build(*self._sample_nodes(mask, generator))
+        self.max_nodes = int(mask.sum()) // (self.sparsification ** 3)
+        print(f"[GaussianWarp] {self.node_position.shape[0]} primitives inside the ROI "
+              f"(sampled {self.num_gaussians}, densification cap {self.max_nodes}).")
+
+    def reset_stats(self):
+        num = self.node_position.shape[0]
+        device = self.node_position.device
+        self.register_buffer("contribution", torch.zeros(num, device=device),
+                             persistent=False)
+        self.register_buffer("counter", torch.zeros(num, device=device),
+                             persistent=False)
+
+    def trained_parameters(self, lr):
+        groups = [
+            {"params": [self.node_position], "name": "node_position", "lr": lr.node_position},
+            {"params": [self.translation], "name": "translation", "lr": lr.translation},
+        ]
+        if self.anisotropy.quaternion:
+            groups.append({"params": [self.node_quaternion], "name": "node_quaternion",
+                           "lr": lr.node_quaternion})
+        if self.anisotropy.scaling:
+            groups.append({"params": [self._node_scaling], "name": "_node_scaling",
+                           "lr": lr.node_scaling})
+        else:
+            groups.append({"params": [self._node_radius], "name": "_node_radius",
+                           "lr": lr.node_radius})
+        if self.with_quaternion:
+            groups.append({"params": [self.quaternion], "name": "quaternion",
+                           "lr": lr.quaternion})
+        return groups
+
+    # ----------------------------------------------------------------- kernel
 
     @property
     def node_radius(self):
         return torch.exp(self._node_radius)
-    
+
     @property
     def node_scaling(self):
         return torch.exp(self._node_scaling)
 
-    def trained_parameters(self, lr):
-        l = [{'params': [self.node_position],   'name': 'node_position',   'lr': lr.node_position},
-             {'params': [self.translation],     'name': 'translation',     'lr': lr.translation}]
-        
-        if self.anisotropy.quaternion:
-            l += [{'params': [self.node_quaternion], 'name': 'node_quaternion', 'lr': lr.node_quaternion}]
-        
-        if self.anisotropy.scaling:
-            l += [{'params': [self._node_scaling],    'name': '_node_scaling',    'lr': lr.node_scaling}]
-        else: 
-            l += [{'params': [self._node_radius],     'name': '_node_radius',     'lr': lr.node_radius}]
-        
-        if self.with_quaternion:
-            l += [{'params': [self.quaternion],      'name': 'quaternion',      'lr': lr.quaternion}]
-        return l
-
-    def make_coors(self, shape):
-        """Make a coordinate tensor."""
-  
-        coords = [torch.linspace(-1, 1, size + 1)[:-1] + 1 / size for size in shape]
-        coords = torch.meshgrid(*coords, indexing="ij")
-        coords = torch.stack(coords[::-1], dim=-1)
-        coords = coords.view(-1, 3)
-
-        diagonal_point_index = shape[1]*shape[2] + shape[2] + 1  
-        diagonal_point = coords[diagonal_point_index]
-        radius = torch.linalg.vector_norm(diagonal_point - coords[0]) * 0.5
-
-        return coords, radius
-
-    def cal_nn_weight(self, x:torch.Tensor, nodes=None, K=None):
+    def cal_nn_weight(self, x, nodes, K=None):
+        """Normalised Gaussian weights of the ``K`` primitives nearest to ``x``."""
         K = self.K if K is None else K
-        _, nn_idxs, _ = ops.knn_points(x[None], nodes[None], None, None, K=K) 
-        nn_idxs = nn_idxs[0]  # both [M, K]
+        _, nn_idxs, _ = ops.knn_points(x[None], nodes[None], None, None, K=K)
+        nn_idxs = nn_idxs[0]
         local_coords = x[:, None] - nodes[nn_idxs]  # [M, K, 3]
+
         if self.anisotropy.scaling:
             if self.anisotropy.quaternion:
-                rot_matrix = self.quaternion_to_matrix(self.node_quaternion)[nn_idxs]  # [M, K, 3, 3] 
-                local_coords = torch.matmul(local_coords.unsqueeze(2), rot_matrix).squeeze()
+                rot_matrix = self.quaternion_to_matrix(self.node_quaternion)[nn_idxs]
+                local_coords = torch.matmul(local_coords.unsqueeze(-2), rot_matrix).squeeze(-2)
             exponent = torch.sum((local_coords / self.node_scaling[nn_idxs]) ** 2, dim=-1)
             nn_weight = torch.exp(-0.5 * exponent)
             nn_weight = nn_weight / (torch.prod(self.node_scaling[nn_idxs], dim=-1) + 1e-7)
-
         else:
             exponent = torch.sum((local_coords / self.node_radius[nn_idxs]) ** 2, dim=-1)
             nn_weight = torch.exp(-0.5 * exponent)
-            nn_weight = nn_weight / (self.node_radius[nn_idxs].squeeze() ** 3 + 1e-7)
-        nn_weight = nn_weight / nn_weight.sum(dim=-1, keepdim=True)  # [M, K]
+            nn_weight = nn_weight / (self.node_radius[nn_idxs].squeeze(-1) ** 3 + 1e-7)
+
+        nn_weight = nn_weight / nn_weight.sum(dim=-1, keepdim=True)
         return nn_weight, nn_idxs, local_coords
 
-    def forward(self, x: torch.Tensor):
-        nn_weight, nn_idxs, local_coords = self.cal_nn_weight(x, self.node_position, K=self.K)  
+    def forward(self, x):
+        nn_weight, nn_idxs, local_coords = self.cal_nn_weight(x, self.node_position)
         if self.with_quaternion:
             local_coords = local_coords.detach()
             rot_matrix = self.quaternion_to_matrix(self.quaternion)[nn_idxs]
-            self.gaussian_wise_translation = torch.matmul(rot_matrix, local_coords.unsqueeze(-1)).squeeze(-1) + self.translation[nn_idxs] - local_coords
+            displacement = (torch.matmul(rot_matrix, local_coords.unsqueeze(-1)).squeeze(-1)
+                            + self.translation[nn_idxs] - local_coords)
         else:
-            self.gaussian_wise_translation = self.translation[nn_idxs]
-        acc_flow = (self.gaussian_wise_translation * nn_weight[..., None]).sum(dim=1)
+            displacement = self.translation[nn_idxs]
+        return (displacement * nn_weight[..., None]).sum(dim=1)
 
-        return acc_flow
-
-    def quaternion_to_matrix(self, quaternions: torch.Tensor) -> torch.Tensor:
-        '''transform quaternion to rotation matrix with normalization'''
+    @staticmethod
+    def quaternion_to_matrix(quaternions):
+        """Convert (unnormalised) quaternions to rotation matrices."""
         r, i, j, k = torch.unbind(quaternions, -1)
         two_s = 2.0 / (quaternions * quaternions).sum(-1)
-        o = torch.stack(
-            (
-                1 - two_s * (j * j + k * k),
-                two_s * (i * j - k * r),
-                two_s * (i * k + j * r),
-                two_s * (i * j + k * r),
-                1 - two_s * (i * i + k * k),
-                two_s * (j * k - i * r),
-                two_s * (i * k - j * r),
-                two_s * (j * k + i * r),
-                1 - two_s * (i * i + j * j),
-            ),
-            -1,
-        )
+        o = torch.stack((
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ), -1)
         return o.reshape(quaternions.shape[:-1] + (3, 3))
 
-    def densify_and_prune(self, optimizer=None):
-        max_contribution = self.max_contribution
-        nodes_contribution = self.contribution / self.counter
-        nodes_contribution[nodes_contribution.isnan()] = 0.
+    # ------------------------------------------------------- adaptive control
 
-        # Picking pts to densify
-        if self.anisotropy.scaling:
-            nan_nodes = self._node_scaling[:, 0].isnan()
-        else:
-            nan_nodes = self._node_radius[:, 0].isnan()
-        densified_pts_mask = torch.logical_and(nodes_contribution >= max_contribution, nan_nodes.logical_not())
-        # Picking pts to prune
-        pruned_pts_mask = torch.logical_or(nodes_contribution <= self.min_contribution, nan_nodes.isnan())
-
-        if self.node_position.shape[0] + densified_pts_mask.sum() - pruned_pts_mask.sum() > self.max_densify_num: 
-            max_contribution = torch.inf  # 不进行 densify
-            densify_num = self.max_densify_num - self.node_position.shape[0] + pruned_pts_mask.sum()
-            idxs = torch.topk(nodes_contribution, densify_num)[1]
-            densified_pts_mask = nodes_contribution >= torch.inf
-            densified_pts_mask[idxs] = True
-
-        tqdm.write(f'\nAdd {densified_pts_mask.sum()} nodes and prune {pruned_pts_mask.sum()} nodes.')
-
-        # Densify and Prune
-        if densified_pts_mask.sum() > 0:
-            # densify
-            if self.anisotropy.scaling:
-                stds = self.node_scaling[densified_pts_mask]
-            else:
-                stds = self.node_radius[densified_pts_mask].repeat(1,3)  # gaussian 的标准差
-            means = torch.zeros((stds.size(0), 3),device="cuda")
-            samples = torch.normal(mean=means, std=stds)
-            new_node_position = samples + self.node_position[densified_pts_mask] 
-
-            new_param_list = {'node_position': new_node_position}
-            if self.anisotropy.quaternion:
-                new_param_list['node_quaternion'] = self.node_quaternion[densified_pts_mask]
-            if self.anisotropy.scaling:
-                new_param_list['_node_scaling'] = self._node_scaling[densified_pts_mask]
-            else:
-                new_param_list['_node_radius'] = self._node_radius[densified_pts_mask]
-
-            new_param_list['translation'] = self.translation[densified_pts_mask]
-            if self.with_quaternion:
-                new_param_list['quaternion'] = self.quaternion[densified_pts_mask]
-                # translation, quaternion 参数
-            
-            for group in optimizer.param_groups:
-                stored_state = optimizer.state.get(group['params'][0], None) 
-                extension_tensor = new_param_list[group['name']]   
-                if stored_state is not None:    
-                    stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0) 
-                    stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0) 
-                    del optimizer.state[group['params'][0]]   
-                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))  
-                    optimizer.state[group['params'][0]] = stored_state 
-                    setattr(self, group['name'], group["params"][0])   
-                else:  
-                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-                    setattr(self, group['name'], group["params"][0])  
-        
-        # Prune
-        if pruned_pts_mask.sum() > 0:  
-            if pruned_pts_mask.shape[0] < self.node_position.shape[0]:  
-                pruned_pts_mask = torch.cat([pruned_pts_mask, torch.zeros([self.node_position.shape[0] - pruned_pts_mask.shape[0]]).to(pruned_pts_mask.device).to(pruned_pts_mask.dtype)])
-            pruned_pts_mask = ~pruned_pts_mask 
-
-            for group in optimizer.param_groups:
-                stored_state = optimizer.state.get(group['params'][0], None)  
-                if stored_state is not None:
-                    stored_state["exp_avg"] = stored_state["exp_avg"][pruned_pts_mask]
-                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][pruned_pts_mask]
-                    del optimizer.state[group['params'][0]]
-                    group["params"][0] = nn.Parameter((group["params"][0][pruned_pts_mask].requires_grad_(True)))
-                    optimizer.state[group['params'][0]] = stored_state  
-                    setattr(self, group['name'], group["params"][0])  
-                else:
-                    group["params"][0] = nn.Parameter(group["params"][0][pruned_pts_mask].requires_grad_(True))
-                    setattr(self, group['name'], group["params"][0])  
-
-        self.densification_postfix()  
-        tqdm.write(f'With {self.node_position.shape[0]} nodes left.')
-
-    def add_densification_stats(self):  
-        self.contribution += torch.norm(self.translation.grad, dim=-1)  
+    @torch.no_grad()
+    def adaptive_control(self, step, max_steps, optimizer):
+        if not self.densify.enabled or step > self.densify.until_ratio * max_steps:
+            return
+        self.contribution += torch.norm(self.translation.grad, dim=-1)
         self.counter += 1
 
-    def densification_postfix(self):
-        self.contribution = torch.zeros(self.node_position.shape[0], device="cuda")
-        self.counter = torch.zeros(self.node_position.shape[0], device="cuda")
+        interval = max(int(self.densify.interval_ratio * max_steps), 1)
+        if step >= self.densify.from_iter and step % interval == 0:
+            self.densify_and_prune(optimizer)
+
+    @torch.no_grad()
+    def densify_and_prune(self, optimizer):
+        score = self.contribution / self.counter
+        score[score.isnan()] = 0.0
+
+        extents = self._node_scaling if self.anisotropy.scaling else self._node_radius
+        invalid = extents[:, 0].isnan()
+        grow = torch.logical_and(score >= self.densify.max_contribution, ~invalid)
+        prune = torch.logical_or(score <= self.densify.min_contribution, invalid)
+
+        budget = self.max_nodes - self.node_position.shape[0] + int(prune.sum())
+        if int(grow.sum()) > budget:
+            grow = torch.zeros_like(grow)
+            if budget > 0:
+                grow[torch.topk(score, budget)[1]] = True
+
+        tqdm.write(f"\nAdd {int(grow.sum())} and prune {int(prune.sum())} primitives.")
+
+        if grow.any():
+            if self.anisotropy.scaling:
+                stds = self.node_scaling[grow]
+            else:
+                stds = self.node_radius[grow].repeat(1, 3)
+            offset = torch.normal(torch.zeros_like(stds), stds,
+                                  generator=getattr(self, "generator", None))
+
+            extensions = {
+                "node_position": self.node_position[grow] + offset,
+                "translation": self.translation[grow],
+            }
+            if self.anisotropy.quaternion:
+                extensions["node_quaternion"] = self.node_quaternion[grow]
+            if self.anisotropy.scaling:
+                extensions["_node_scaling"] = self._node_scaling[grow]
+            else:
+                extensions["_node_radius"] = self._node_radius[grow]
+            if self.with_quaternion:
+                extensions["quaternion"] = self.quaternion[grow]
+            self._extend_params(optimizer, extensions)
+
+        if prune.any():
+            keep = torch.ones(self.node_position.shape[0], dtype=torch.bool,
+                              device=prune.device)
+            keep[: prune.shape[0]] = ~prune
+            self._prune_params(optimizer, keep)
+
+        self.reset_stats()
+        tqdm.write(f"With {self.node_position.shape[0]} primitives left.")
+
+    def _extend_params(self, optimizer, extensions):
+        """Append new rows to every parameter group and to the Adam moments."""
+        for group in optimizer.param_groups:
+            param = group["params"][0]
+            extension = extensions[group["name"]]
+            state = optimizer.state.pop(param, None)
+            if state is not None:
+                zeros = torch.zeros_like(extension)
+                state["exp_avg"] = torch.cat((state["exp_avg"], zeros), dim=0)
+                state["exp_avg_sq"] = torch.cat((state["exp_avg_sq"], zeros), dim=0)
+            new = nn.Parameter(torch.cat((param.data, extension), dim=0).requires_grad_(True))
+            group["params"][0] = new
+            if state is not None:
+                optimizer.state[new] = state
+            setattr(self, group["name"], new)
+
+    def _prune_params(self, optimizer, keep):
+        """Drop rows from every parameter group and from the Adam moments."""
+        for group in optimizer.param_groups:
+            param = group["params"][0]
+            state = optimizer.state.pop(param, None)
+            if state is not None:
+                state["exp_avg"] = state["exp_avg"][keep]
+                state["exp_avg_sq"] = state["exp_avg_sq"][keep]
+            new = nn.Parameter(param.data[keep].requires_grad_(True))
+            group["params"][0] = new
+            if state is not None:
+                optimizer.state[new] = state
+            setattr(self, group["name"], new)

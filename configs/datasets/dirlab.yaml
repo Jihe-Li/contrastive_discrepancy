@@ -1,0 +1,12 @@
+# DIRLab 4DCT -- http://www.dir-lab.com
+type: DIRLab
+
+root: /storage/research/artorg_mia/home/jiheli/workspace_extension/FounDIR/dirlab
+case_idx: 1
+fix_phase: 0            # T00, maximum inhalation
+mov_phase: 5            # T50, maximum exhalation
+mask_folder: Lungs
+
+batch_size: 20000
+neighs: 3               # neighbours per centre used by the TV regulariser
+fill_value: -1000.0     # intensity written outside the ROI (air, in HU)

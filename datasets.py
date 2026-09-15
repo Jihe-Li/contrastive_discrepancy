@@ -1,63 +1,91 @@
-import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 
+import loaders
 import utils
-from loaders import load_DIRLab
 
 OFFSET = -0.5
 
 
 class RegDataset(IterableDataset):
-    """This is a class for registrating implicitly represented images."""
+    """Base class for coordinate-sampled deformable image registration.
 
-    def __init__(self, case_idx):
+    The image pair is represented implicitly: each iteration yields a batch of
+    normalised coordinates drawn from the ROI of the fixed image, each centre
+    followed by ``neighs`` axis neighbours used by the TV regulariser.
+
+    A subclass only has to implement :meth:`load`, returning the fixed and moving
+    volumes, their ROI masks, the geometry of the fixed image and -- optionally --
+    landmark pairs used to report a reference TRE.
+    """
+
+    _TENSORS = ("fix_arr", "mov_arr", "fix_mask", "mov_mask", "fix_marks",
+                "mov_marks", "aug_mov_arr", "aug_mov_marks", "voxel_units",
+                "voxel_size", "image_size", "masked_coords", "indices")
+
+    def __init__(self, batch_size=20000, neighs=3, fill_value=-1000.0, seed=0):
         super().__init__()
-        self.case_idx = case_idx
-        self.batch_size = 20000
-        self.neighs = 3
+        self.batch_size = batch_size
+        self.neighs = neighs
+        self.fill_value = fill_value
         self.device = torch.device("cpu")
+        self.generator = torch.Generator().manual_seed(seed)
 
-        named_data = load_DIRLab(case_idx=self.case_idx)
-        self.fix_arr = named_data["fix_arr"].unsqueeze(0).unsqueeze(0)
-        self.mov_arr = named_data["mov_arr"].unsqueeze(0).unsqueeze(0)
-        self.fix_mask = named_data["fix_mask"]
-        self.mov_mask = named_data["mov_mask"]
-        if "fix_marks" in named_data:
-            self.fix_marks = named_data["fix_marks"]
-        if "mov_marks" in named_data:
-            self.mov_marks = named_data["mov_marks"]
-        self.params = named_data["params"]
+        data = self.load()
+        self.fix_arr = data["fix_arr"][None, None]
+        self.mov_arr = data["mov_arr"][None, None]
+        self.fix_mask = data["fix_mask"]
+        self.mov_mask = data["mov_mask"]
+        self.fix_marks = data.get("fix_marks")
+        self.mov_marks = data.get("mov_marks")
+        self.params = data["params"]
+        self.aug_mov_arr = None
+        self.aug_mov_marks = None
 
         self.voxel_size = torch.FloatTensor(self.params["spacing"])
         self.image_size = torch.FloatTensor(self.params["size"])
-
-        self.batch_center_num = self.batch_size // (self.neighs + 1)
+        self.batch_center_num = max(self.batch_size // (self.neighs + 1), 1)
         self.voxel_units = torch.eye(3)[None] * (2 / self.image_size)
-
         self.masked_coords = utils.make_coords(self.fix_mask.shape, self.fix_mask)
         self.shuffle()
+
+    # ------------------------------------------------------------------ hooks
+
+    def load(self):
+        """Return a dict with fix/mov volumes, masks, landmarks and geometry."""
+        raise NotImplementedError
+
+    @property
+    def name(self):
+        return type(self).__name__
+
+    # ------------------------------------------------------------------ setup
 
     @property
     def shape(self):
         return self.fix_arr.shape[-3:]
 
-    def arr2nii(self, array, save_path="", params=None):
-        if params is None:
-            params = self.params
-        direction = params.get("direction", [1, 0, 0, 0, 1, 0, 0, 0, 1])
-        origin = params.get("origin", [0, 0, 0])
-        spacing = params.get("spacing", self.voxel_size.tolist())
+    @property
+    def has_landmarks(self):
+        return self.fix_marks is not None and self.mov_marks is not None
 
-        image = sitk.GetImageFromArray(array)
-        image.SetDirection(direction)
-        image.SetOrigin(origin)
-        image.SetSpacing(spacing)
+    def build_orbit_sample(self, transform):
+        """Create the second orbit observation ``M_b = g * M_a``."""
+        self.aug_mov_arr = transform(self.mov_arr[0, 0])[None, None]
+        if self.mov_marks is not None:
+            self.aug_mov_marks = transform.augment_landmarks(self.mov_marks)
+        return self
 
-        if save_path:
-            sitk.WriteImage(image, save_path)
-        return image
+    def to(self, device):
+        self.device = torch.device(device)
+        for name in self._TENSORS:
+            tensor = getattr(self, name, None)
+            if torch.is_tensor(tensor):
+                setattr(self, name, tensor.to(self.device))
+        return self
+
+    # ------------------------------------------------------------ coordinates
 
     def abs2rel(self, coords):
         return 2 * (coords + OFFSET) / self.image_size - 1.0
@@ -68,72 +96,55 @@ class RegDataset(IterableDataset):
     def abs2phys(self, coords):
         return coords * self.voxel_size
 
+    # --------------------------------------------------------------- sampling
+
+    def reseed(self, seed):
+        """Restart the sampling stream, so a registration always sees the same order.
+
+        Called once per registration, which keeps the coordinate ordering a
+        function of that branch's seed rather than of how many registrations
+        happened to run before it.
+        """
+        self.generator.manual_seed(seed)
+        self.shuffle()
+
     def shuffle(self):
-        self.indices = torch.randperm(self.masked_coords.shape[0], device=self.device)
+        # Drawn from the dataset's own generator so that sampling order never
+        # perturbs -- and is never perturbed by -- model initialisation.
+        perm = torch.randperm(self.masked_coords.shape[0], generator=self.generator)
+        self.indices = perm.to(self.device)
         self.iter_self = iter(range(0, len(self.indices), self.batch_center_num))
-
-    def to(self, device):
-        self.device = device
-        self.fix_arr = self.fix_arr.to(device)
-        self.mov_arr = self.mov_arr.to(device)
-        self.fix_mask = self.fix_mask.to(device)
-        self.mov_mask = self.mov_mask.to(device)
-        if hasattr(self, "fix_marks"):
-            self.fix_marks = self.fix_marks.to(device)
-        if hasattr(self, "mov_marks"):
-            self.mov_marks = self.mov_marks.to(device)
-        if hasattr(self, "voxel_units"):
-            self.voxel_units = self.voxel_units.to(device)
-
-        self.indices = self.indices.to(device)
-        self.voxel_size = self.voxel_size.to(device)
-        self.image_size = self.image_size.to(device)
-        self.masked_coords = self.masked_coords.to(device)
-
-        return self
 
     def __iter__(self):
         while True:
             try:
                 idx = next(self.iter_self)
-                coords = self.masked_coords[self.indices[idx: idx + self.batch_center_num]]
-                neigh_coords = coords[:, None] + self.voxel_units
-                neigh_coords = neigh_coords.reshape(-1, 3)
-                coords = torch.concat([coords, neigh_coords], dim=0)
-                
-                yield coords
-
             except StopIteration:
                 self.shuffle()
                 continue
+            coords = self.masked_coords[self.indices[idx: idx + self.batch_center_num]]
+            neigh_coords = (coords[:, None] + self.voxel_units).reshape(-1, 3)
+            yield torch.concat([coords, neigh_coords], dim=0)
 
     def __len__(self):
         return len(self.indices)
 
-    def masked_gather(self, tensor, mask=None, is_flow=False):
-        if is_flow:
-            full_size = self.shape + (3,)
-            full_tensor = torch.zeros(full_size, device=self.device)
-        else:
-            full_size = self.shape
-            full_tensor = torch.ones(full_size, device=self.device) * -1000
-        if mask is None:
-            mask = self.fix_mask
-        full_tensor[mask] = tensor
-        return full_tensor
-
     def __getitem__(self, index):
         return self.masked_coords[index]
 
+    def scatter_to_volume(self, values, mask=None, is_flow=False):
+        """Scatter ROI values back onto the full grid, padding with ``fill_value``."""
+        mask = self.fix_mask if mask is None else mask
+        if is_flow:
+            volume = torch.zeros(self.shape + (3,), device=self.device)
+        else:
+            volume = torch.full(self.shape, self.fill_value, device=self.device)
+        volume[mask] = values
+        return volume
+
     def _sampling(self, coords, tensor, mode="bilinear"):
-        coords = coords.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        return (
-            F.grid_sample(tensor, coords, mode=mode, align_corners=False)
-            .squeeze(0)
-            .squeeze(0)
-            .squeeze(0)
-            .squeeze(0)
-        )
+        coords = coords[None, None, None]
+        return F.grid_sample(tensor, coords, mode=mode, align_corners=False).flatten()
 
     def samp_fix(self, coords):
         return self._sampling(coords, self.fix_arr)
@@ -141,26 +152,50 @@ class RegDataset(IterableDataset):
     def samp_mov(self, coords):
         return self._sampling(coords, self.mov_arr)
 
-
-class CDDataset(RegDataset):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        aug = utils.Augment(self.params["size"][::-1])
-        self.aug_mov_arr = aug(self.mov_arr.squeeze(0).squeeze(0)).unsqueeze(0).unsqueeze(0) 
-        if hasattr(self, "mov_mask"):
-            self.aug_mov_mask = aug(self.mov_mask, mode="nearest")
-        if hasattr(self, "mov_marks"):
-            self.aug_mov_marks = aug.augment_landmarks(self.mov_marks)
-
-    def to(self, device):
-        super().to(device)
-        self.aug_mov_arr = self.aug_mov_arr.to(device)
-        if hasattr(self, "mov_mask"):
-            self.aug_mov_mask = self.aug_mov_mask.to(device)
-        if hasattr(self, "mov_marks"):
-            self.aug_mov_marks = self.aug_mov_marks.to(device)
-
-        return self
-
     def samp_aug_mov(self, coords):
         return self._sampling(coords, self.aug_mov_arr)
+
+    def sampler(self, volume):
+        """Build a sampling callable for an arbitrary volume of shape ``shape``."""
+        volume = volume[None, None]
+        return lambda coords: self._sampling(coords, volume)
+
+
+class DIRLab(RegDataset):
+    """DIRLab 4DCT: 10 lung cases with 300 annotated landmarks each."""
+
+    def __init__(self, root="data/DIRLab", case_idx=1, fix_phase=0, mov_phase=5,
+                 mask_folder="Lungs", **kwargs):
+        self.root = root
+        self.case_idx = case_idx
+        self.fix_phase = fix_phase
+        self.mov_phase = mov_phase
+        self.mask_folder = mask_folder
+        super().__init__(**kwargs)
+
+    @property
+    def name(self):
+        return f"DIRLab-Case{self.case_idx}"
+
+    def load(self):
+        return loaders.load_DIRLab(self.root, self.case_idx, self.fix_phase,
+                                   self.mov_phase, self.mask_folder)
+
+
+class NiftiPair(RegDataset):
+    """A single fixed/moving pair given by explicit file paths."""
+
+    def __init__(self, fix_image, mov_image, fix_mask=None, mov_mask=None,
+                 fix_marks=None, mov_marks=None, name="pair", **kwargs):
+        self.paths = dict(fix_image=fix_image, mov_image=mov_image,
+                          fix_mask=fix_mask, mov_mask=mov_mask,
+                          fix_marks=fix_marks, mov_marks=mov_marks)
+        self._name = name
+        super().__init__(**kwargs)
+
+    @property
+    def name(self):
+        return self._name
+
+    def load(self):
+        return loaders.load_pair(**self.paths)

@@ -1,2 +1,4 @@
+from .residual import field_norm
 from .tre import compute_landmark_accuracy
-from .triplet import comp_triplet
+
+__all__ = ["field_norm", "compute_landmark_accuracy"]

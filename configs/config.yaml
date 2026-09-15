@@ -1,0 +1,52 @@
+# Top-level configuration: everything that defines the Contrastive Discrepancy
+# metric itself and the testing-time hyperparameter search around it.
+# Model / optimiser / dataset specifics live in the config groups below.
+
+defaults:
+  - _self_
+  - network: gaussian
+  - optimizer: adam
+  - datasets: dirlab
+  - override hydra/job_logging: none
+  - override hydra/hydra_logging: none
+
+seed: 6
+device: cuda
+
+# --- Contrastive Discrepancy -------------------------------------------------
+metric: CD3           # CD2 | CD3 | both
+cd3_units: voxel      # voxel | mm  (unit of the residual deformation field)
+paired_init: false    # seed the two orbit branches identically, so that CD
+                      # reflects the group action alone and not the random
+                      # initialisation. `false` reproduces the paper.
+
+# The group action g that turns the observed moving image M_a into a second
+# observation M_b = g * M_a of the same anatomy. Keep it a subtle perturbation.
+transform:
+  type: Affine
+  scale: 1.05         # scalar (isotropic) or [sx, sy, sz]
+  rotation: null      # degrees: scalar or [rx, ry, rz], read as an axis-angle
+  jitter: null        # relative magnitude of additive intensity noise
+
+# --- optimisation budget of a single registration ----------------------------
+max_steps: 2000
+chunk_size: 50000
+similarity: NCC
+lambda_tv: 8.0
+
+# --- testing-time hyperparameter selection -----------------------------------
+tuning:
+  param: network.num_gaussians   # dotted path of the hyperparameter to tune
+  lower: 200
+  upper: 204800
+  log_base: 2
+  iters: 5
+  tol: 0.0
+  log_dir: outputs/tuning
+
+out_csv: outputs/results.csv
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

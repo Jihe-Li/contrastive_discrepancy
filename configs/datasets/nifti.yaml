@@ -1,0 +1,16 @@
+# A single fixed/moving pair given by explicit paths. Masks and landmarks are
+# optional; without landmarks no reference TRE is reported, which is exactly
+# the label-free setting CD is designed for.
+type: NiftiPair
+
+name: pair
+fix_image: ???
+mov_image: ???
+fix_mask: null
+mov_mask: null
+fix_marks: null
+mov_marks: null
+
+batch_size: 20000
+neighs: 3
+fill_value: -1000.0

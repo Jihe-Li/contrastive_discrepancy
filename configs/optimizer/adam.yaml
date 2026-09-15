@@ -1,0 +1,14 @@
+# Optimiser and learning-rate schedule. The keys under `lr` must match the
+# parameter-group names returned by the network's `trained_parameters()`.
+type: Adam
+
+lr:
+  node_position: 0.005
+  node_radius: 0.02
+  node_scaling: 0.01
+  node_quaternion: 0.005
+  translation: 0.002
+  quaternion: 0.005
+
+schedule:
+  warmup_steps: 50      # linear warm-up, then cosine decay to zero

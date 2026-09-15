@@ -1,86 +1,78 @@
-import os
-import numpy as np
-from omegaconf import DictConfig
-from hydra import initialize, compose
+import math
+from pathlib import Path
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+import utils
 from registrators import CDRegistrator
 
 
-def evaluate_model_cd(cfg, param):
-    cfg.network.max_densify_num = param
-    
-    registrator = CDRegistrator(cfg)
-    _, CD3, tre_mean, _ = registrator.evaluate_cd()
-
-    return CD3, tre_mean
+def evaluate(cfg: DictConfig, value):
+    """Run one full CD evaluation with the tuned hyperparameter set to ``value``."""
+    trial = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    OmegaConf.update(trial, cfg.tuning.param, value)
+    return CDRegistrator(trial).run()
 
 
-def ternary_search_log_scale(case_idx, lambda_l, lambda_r, log_base, iters=5):
+def ternary_search(cfg: DictConfig, log):
+    """Locate the minimum of the (unimodal) CD curve in log-scale.
+
+    Implements Algorithm 1 of the paper: each iteration evaluates CD at two
+    interior points and discards the third of the interval that cannot contain
+    the minimum, so the search cost is logarithmic in the range rather than
+    linear in the number of candidate values.
     """
-    Perform ternary search in log scale to find optimal lambda.
-    Input:
-        log_l: log10(lambda_1)
-        log_r: log10(lambda_2)
-        eps:   tolerance for convergence (in log10 scale)
-    Output:
-        best_lambda: optimal lambda value (not in log scale)
-        best_metric: minimal metric value
-    """
-    with initialize(version_base=None, config_path="configs"):
-        cfg: DictConfig = compose(config_name="gaussian.yaml")
+    tuning = cfg.tuning
+    key = "CD3" if cfg.metric == "both" else cfg.metric
+    base = float(tuning.log_base)
+    lo, hi = math.log(tuning.lower, base), math.log(tuning.upper, base)
 
-    cfg.case_idx = case_idx
+    for iteration in range(1, tuning.iters + 1):
+        if hi - lo <= tuning.tol:
+            break
+        m1, m2 = lo + (hi - lo) / 3, hi - (hi - lo) / 3
+        v1, v2 = int(base ** m1), int(base ** m2)
+        r1, r2 = evaluate(cfg, v1), evaluate(cfg, v2)
 
-    log_l = eval('np.log%d' % log_base)(lambda_l)
-    log_r = eval('np.log%d' % log_base)(lambda_r)
+        log(f"iter {iteration}/{tuning.iters}  {tuning.param}={v1}  " + fmt(r1, key))
+        log(f"iter {iteration}/{tuning.iters}  {tuning.param}={v2}  " + fmt(r2, key))
 
-    for i in range(iters):
-        m1 = log_l + (log_r - log_l) / 3
-        m2 = log_r - (log_r - log_l) / 3
-        f1, tre1 = evaluate_model_cd(cfg, int(log_base ** m1))
-        f2, tre2 = evaluate_model_cd(cfg, int(log_base ** m2))
-        if f1 > f2:
-            log_l = m1
+        if r1[key] > r2[key]:
+            lo = m1
         else:
-            log_r = m2
-        
-        message = f"Case {cfg.case_idx}\n" 
-        message += f"Iteration {i + 1}/{iters}; Param: {int(log_base ** m1)}, CD3: {f1.detach().cpu().numpy():.6f}, TRE: {tre1[0]:.6f}\n"
-        message += f"Iteration {i + 1}/{iters}; Param: {int(log_base ** m2)}, CD3: {f2.detach().cpu().numpy():.6f}, TRE: {tre2[0]:.6f}\n"
+            hi = m2
 
-        path = f'outputs/DIRLab_tuning_iter{iters}_CD/log_{cfg.case_idx}.txt'
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'a') as f:
-            f.write(message)
-
-    best_log_lambda = (log_l + log_r) / 2
-    best_lambda = int(log_base ** best_log_lambda)
-    best_metric = eval('evaluate_model_%s' % 'CD')(cfg, best_lambda)
-    message = f"Final best param: {best_lambda}, Metric: {best_metric[0].detach().cpu().numpy():.6f}, TRE: {best_metric[1][0]:.6f}\n"
-    with open(path, 'a') as f:
-        f.write(message)
-    return best_lambda, best_metric
+    best = int(base ** ((lo + hi) / 2))
+    result = evaluate(cfg, best)
+    log(f"selected  {tuning.param}={best}  " + fmt(result, key))
+    return best, result
 
 
-if __name__ == '__main__':
+def fmt(result, key):
+    fields = [f"{key}: {result[key]:.6f}"]
+    if "TRE" in result:
+        fields.append(f"TRE: {result['TRE']:.4f}")
+    return "  ".join(fields)
 
-    import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--lambda_l', default=200, type=int)
-    parser.add_argument('--lambda_r', default=204800, type=int)
-    parser.add_argument('--log_base', default=2, type=int)
-    parser.add_argument('--iters', default=5, type=int)
-    args = parser.parse_args()
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    """Select a hyperparameter at testing time by minimising CD -- no labels used."""
+    tag = cfg.datasets.get("case_idx", cfg.datasets.get("name", "pair"))
+    path = Path(cfg.tuning.log_dir) / f"{cfg.datasets.type}_{tag}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Run ternary search
-    for case_idx in range(1, 11):
-        best_lambda, best_metric = ternary_search_log_scale(case_idx,
-                                                            args.lambda_l, 
-                                                            args.lambda_r, 
-                                                            args.log_base, 
-                                                            args.iters)
+    def log(message):
+        print(message)
+        with path.open("a") as f:
+            f.write(message + "\n")
 
-        print(f"Case_idx{case_idx}, Best lambda: {best_lambda:.6f}")
-        print(f"Case_idx{case_idx}, Metric at best lambda: {best_metric[0].detach().cpu().numpy():.6f}")
-        print(f"Case_idx{case_idx}, TRE at best lambda: {best_metric[1][0]:.6f}")
+    best, result = ternary_search(cfg, log)
+
+    if cfg.out_csv:
+        utils.append_csv(cfg.out_csv, {"stage": "tuned", cfg.tuning.param: best, **result})
+
+
+if __name__ == "__main__":
+    main()

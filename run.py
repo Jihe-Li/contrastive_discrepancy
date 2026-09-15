@@ -1,14 +1,22 @@
 import hydra
 from omegaconf import DictConfig
+
+import utils
 from registrators import CDRegistrator
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="gaussian.yaml")
+@hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-
+    """Evaluate Contrastive Discrepancy for one model configuration."""
     registrator = CDRegistrator(cfg)
-    CD2, CD3, tre_mean, tre_std = registrator.evaluate_cd()
-    print(f"Case {cfg.case_idx}, CD2: {CD2:.4f}, CD3: {CD3:.4f}, TRE: {tre_mean[0]:.4f}±{tre_std[0]:.4f}")
+    result = registrator.run()
+    print(registrator.summary(result))
+
+    if cfg.out_csv:
+        row = {"dataset": registrator.dataset.name,
+               cfg.tuning.param: utils.get_by_path(cfg, cfg.tuning.param),
+               **result}
+        utils.append_csv(cfg.out_csv, row)
 
 
 if __name__ == "__main__":

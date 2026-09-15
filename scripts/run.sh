@@ -1,7 +1,13 @@
-gpu_id=4
+#!/usr/bin/env bash
+# Sweep model complexity over the full DIRLab dataset and record CD next to the
+# reference TRE. This reproduces the dataset-level curves of the paper.
+set -e
 
-for gaussian_num in 204800 102400 51200 25600 12800 6400 3200 1600 800 400 200;
-do
-CUDA_VISIBLE_DEVICES=$gpu_id, python run.py \
-                                     network.max_densify_num=$gaussian_num
+for case_idx in $(seq 1 10); do
+  for num_gaussians in 200 400 800 1600 3200 6400 12800 25600 51200 102400 204800; do
+    python run.py \
+      datasets.case_idx="${case_idx}" \
+      network.num_gaussians="${num_gaussians}" \
+      metric=both
+  done
 done
